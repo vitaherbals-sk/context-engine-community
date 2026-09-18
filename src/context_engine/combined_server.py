@@ -245,6 +245,20 @@ def create_app():
     async def health(request):
         return PlainTextResponse("ok")
 
+    # RFC 9728 protected resource metadata — without it a client cannot discover
+    # how this server signs in, and OAuth setup has to be configured by hand.
+    # Served at both the bare path and the /sse suffix clients derive from the
+    # resource URL.
+    issuer = str(mcp_auth_settings.issuer_url)
+
+    async def protected_resource_metadata(request):
+        return JSONResponse({
+            "resource": f"{server_url}/sse",
+            "authorization_servers": [issuer],
+            "scopes_supported": ["user"],
+            "bearer_methods_supported": ["header"],
+        })
+
     async def upload_db(request):
         auth = request.headers.get("authorization", "")
         if auth != f"Bearer {oauth_pass}":
@@ -260,6 +274,8 @@ def create_app():
     # ── Routes ────────────────────────────────────────────────
     all_routes = [
         Route("/health", health),
+        Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
+        Route("/.well-known/oauth-protected-resource/sse", protected_resource_metadata),
         Route("/admin/upload-db", upload_db, methods=["POST"]),
         Mount("/api", app=api_mcp_app),   # API key: /api/sse, /api/messages/
     ] + oauth_routes + [
