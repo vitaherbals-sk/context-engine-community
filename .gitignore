@@ -66,3 +66,6 @@ CONTEXT.md
 *-maintenance-report-*.md
 *-prehlad.html
 briefing-*.docx
+
+# Local MCP client config (contains your private instance URL)
+.mcp.json
