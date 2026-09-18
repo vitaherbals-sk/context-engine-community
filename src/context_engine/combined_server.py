@@ -10,11 +10,12 @@ Tools are registered via shared register_tools() function.
 
 import os
 import sys
+import json
 import asyncio
 
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
-from starlette.responses import PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from uvicorn import Config, Server
 
@@ -26,6 +27,117 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 
 TOKEN_LIFETIME = 365 * 24 * 3600
+
+
+# Max body we buffer for validation — mirrors SseServerTransport's own 4 MiB
+# limit, so anything bigger is rejected downstream anyway.
+MAX_VALIDATED_BODY = 4 * 1024 * 1024
+
+
+class JSONBodyGuardMiddleware:
+    """ASGI middleware — reject malformed POST bodies with a readable error.
+
+    The MCP SSE transport answers an unparseable body with a bare
+    400 "Could not parse message" and pushes the ValidationError into the
+    session stream, where it surfaces as an opaque
+    {"logger": "mcp.server.exception_handler", "data": "Internal Server Error"}
+    notification. That hides the two things that actually go wrong in practice:
+
+    1. The body is not valid UTF-8 (a shell re-encoded the payload into the
+       console codepage, e.g. cp1250, so "vyzivove" with diacritics arrives as
+       raw high bytes).
+    2. The body is valid UTF-8 but truncated, because Content-Length counted
+       characters instead of bytes — non-ASCII text is >1 byte per character.
+
+    Both are indistinguishable from a server bug unless we say so. This
+    middleware decodes and json-parses the body first and returns a concrete
+    diagnosis; well-formed bodies are replayed downstream untouched.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+
+        chunks = []
+        size = 0
+        oversized = False
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                chunks.append(message)
+                break
+            chunks.append(message)
+            size += len(message.get("body", b""))
+            more_body = message.get("more_body", False)
+            if size > MAX_VALIDATED_BODY:
+                oversized = True
+                break
+
+        replay = _replay_receive(chunks, receive, exhausted=not more_body)
+
+        if not oversized:
+            body = b"".join(m.get("body", b"") for m in chunks if m["type"] == "http.request")
+            error = _diagnose_body(body)
+            if error:
+                response = JSONResponse(
+                    {"error": "invalid_request_body", "detail": error},
+                    status_code=400,
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, replay, send)
+
+
+def _replay_receive(chunks, receive: Receive, exhausted: bool) -> Receive:
+    """Hand the buffered messages back to the downstream app, in order."""
+    pending = list(chunks)
+
+    async def _receive():
+        if pending:
+            return pending.pop(0)
+        if exhausted:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return await receive()
+
+    return _receive
+
+
+def _diagnose_body(body: bytes) -> str | None:
+    """Return a human-readable reason the body is unusable, or None if it's fine."""
+    if not body:
+        return None  # let the transport handle empty bodies as before
+
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as err:
+        snippet = body[max(0, err.start - 20):err.start + 20]
+        return (
+            f"Request body is not valid UTF-8: {err.reason} at byte {err.start} "
+            f"(offending bytes: {body[err.start:err.end]!r}, context: {snippet!r}). "
+            "The body was most likely re-encoded by the shell into a legacy "
+            "codepage. Send the JSON as UTF-8 bytes (e.g. curl --data-binary @file.json "
+            "with a UTF-8 file), or escape non-ASCII using JSON unicode escapes."
+        )
+
+    try:
+        json.loads(text)
+    except json.JSONDecodeError as err:
+        hint = ""
+        if len(body) != len(text):
+            hint = (
+                f" The body is {len(body)} bytes but {len(text)} characters — if the "
+                "client set Content-Length from the character count, the body arrived "
+                "truncated. Content-Length must be the UTF-8 byte length."
+            )
+        return f"Request body is not valid JSON: {err.msg} (line {err.lineno}, column {err.colno}).{hint}"
+
+    return None
 
 
 class BearerTokenMiddleware:
@@ -110,7 +222,7 @@ def create_app():
     mcp.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     )
-    oauth_mcp_app = mcp.sse_app()
+    oauth_mcp_app = JSONBodyGuardMiddleware(mcp.sse_app())
 
     # ── MCP instance 2: No auth (API key handled by middleware) ──
     from mcp.server.fastmcp import FastMCP
@@ -127,7 +239,7 @@ def create_app():
     # Copy all tools from OAuth instance to API key instance
     for name, tool in mcp._tool_manager._tools.items():
         mcp_api._tool_manager._tools[name] = tool
-    api_mcp_app = BearerTokenMiddleware(mcp_api.sse_app(), api_key)
+    api_mcp_app = BearerTokenMiddleware(JSONBodyGuardMiddleware(mcp_api.sse_app()), api_key)
 
     # ── Utility endpoints ─────────────────────────────────────
     async def health(request):
